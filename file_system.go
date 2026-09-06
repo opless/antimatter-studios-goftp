@@ -366,6 +366,8 @@ type ftpFile struct {
 	size  int64
 	mode  os.FileMode
 	mtime time.Time
+	owner string
+	group string
 	raw   string
 }
 
@@ -664,6 +666,14 @@ func parseMLST(entry string, skipSelfParent bool) (os.FileInfo, error) {
 		mtime: mtime,
 		raw:   entry,
 		mode:  mode,
+	}
+
+	if facts["unix.owner"] != "" {
+		info.owner = facts["unix.owner"]
+	}
+
+	if facts["unix.group"] != "" {
+		info.group = facts["unix.group"]
 	}
 
 	return info, nil
