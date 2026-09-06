@@ -1,3 +1,3 @@
-module github.com/antimatter-studios/goftp
+module github.com/opless/antimatter-studios-goftp
 
 go 1.21
