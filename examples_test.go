@@ -11,7 +11,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/antimatter-studios/goftp"
+	"github.com/opless/antimatter-studios-goftp"
 )
 
 func Example() {
