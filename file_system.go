@@ -129,29 +129,78 @@ func commandNotSupporterdError(err error) bool {
 }
 
 // ReadDir fetches the contents of a directory, returning a list of
-// os.FileInfo's which are relatively easy to work with programatically. It
+// os.FileInfo's which are relatively easy to work with programmatically. It
 // will not return entries corresponding to the current directory or parent
 // directories. The os.FileInfo's fields may be incomplete depending on what
 // the server supports. If the server does not support "MLSD", "LIST" will
 // be used. You may have to set ServerLocation in your config to get (more)
 // accurate ModTimes in this case.
 func (c *Client) ReadDir(path string) ([]os.FileInfo, error) {
+	fileInfos, err := c.ReadDirViaMLSD(path)
+	if err != nil {
+		if !commandNotSupporterdError(err) {
+			return nil, err
+		}
+		fileInfos, err = c.ReadDirViaLIST(path)
+	}
+	return fileInfos, err
+}
+
+// ReadDirViaMLSD fetches the contents of a directory, returning a list of
+// os.FileInfo's which are relatively easy to work with programmatically. It
+// will not return entries corresponding to the current directory or parent
+// directories. The os.FileInfo's fields may be incomplete depending on what
+// the server supports. If the server does not support "MLSD", "LIST" will
+// be used. You may have to set ServerLocation in your config to get (more)
+// accurate ModTimes in this case.
+//
+// This function is a wrapper around the control command "MLSD <path>".
+//
+// The returned os.FileInfo's are of type *ftpFile, which implements
+// os.FileInfo and os.FileMode. The os.FileMode's fields are the same as
+// those of the FTP server's "MLSD" response.
+//
+// The returned os.FileInfo's are sorted by name.
+//
+// The returned os.FileInfo's are not guaranteed to be in any particular
+// order.
+//
+// The returned os.FileInfo's are not guaranteed to be unique.
+func (c *Client) ReadDirViaMLSD(path string) ([]os.FileInfo, error) {
 	entries, err := c.dataStringList("MLSD %s", path)
 
 	parser := parseMLST
 
 	if err != nil {
-		if !commandNotSupporterdError(err) {
+		return nil, err
+	}
+
+	var ret []os.FileInfo
+	for _, entry := range entries {
+		info, err := parser(entry, true)
+		if err != nil {
+			c.debug("error in ReadDir: %s", err)
 			return nil, err
 		}
 
-		entries, err = c.dataStringList("LIST %s", path)
-		if err != nil {
-			return nil, err
+		if info == nil {
+			continue
 		}
-		parser = func(entry string, skipSelfParent bool) (os.FileInfo, error) {
-			return parseLIST(entry, c.config.ServerLocation, skipSelfParent)
-		}
+
+		ret = append(ret, info)
+	}
+
+	return ret, nil
+}
+
+// ReadDirViaLIST is like ReadDirViaMLSD, but uses "LIST" instead of "MLSD".
+func (c *Client) ReadDirViaLIST(path string) ([]os.FileInfo, error) {
+	entries, err := c.dataStringList("LIST %s", path)
+	if err != nil {
+		return nil, err
+	}
+	parser := func(entry string, skipSelfParent bool) (os.FileInfo, error) {
+		return parseLIST(entry, c.config.ServerLocation, skipSelfParent)
 	}
 
 	var ret []os.FileInfo
@@ -178,11 +227,20 @@ func (c *Client) ReadDir(path string) ([]os.FileInfo, error) {
 // is a directory. You may have to set ServerLocation in your config to get
 // (more) accurate ModTimes when using "LIST".
 func (c *Client) Stat(path string) (os.FileInfo, error) {
+	fileInfo, err := c.StatViaMLST(path)
+	if err != nil {
+		if !commandNotSupporterdError(err) {
+			return nil, err
+		}
+		fileInfo, err = c.StatViaLIST(path)
+	}
+	return fileInfo, err
+}
+
+// StatViaMLST describes the path on a server that supports MLST.
+func (c *Client) StatViaMLST(path string) (os.FileInfo, error) {
 	lines, err := c.controlStringList("MLST %s", path)
 	if err != nil {
-		if commandNotSupporterdError(err) {
-			return c.statViaLIST(path)
-		}
 		return nil, err
 	}
 
@@ -206,7 +264,7 @@ func (c *Client) Stat(path string) (os.FileInfo, error) {
 	return info, nil
 }
 
-// statViaLIST describes path on a server that does not implement MLST.
+// StatViaLIST describes path on a server that does not implement MLST.
 //
 // A plain "LIST <path>" cannot do this. Given a directory, LIST returns
 // that directory's *contents*, so the caller was handed a description of
@@ -217,7 +275,7 @@ func (c *Client) Stat(path string) (os.FileInfo, error) {
 //
 // Two ways to ask about the entry itself, tried in that order because
 // the first costs one round trip and the second costs two.
-func (c *Client) statViaLIST(path string) (os.FileInfo, error) {
+func (c *Client) StatViaLIST(path string) (os.FileInfo, error) {
 	want := filepath.Base(strings.TrimRight(path, "/"))
 
 	// "LIST -d" is ls's flag for "the entry, not what is inside it", and
