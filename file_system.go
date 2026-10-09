@@ -425,6 +425,18 @@ type ftpFile struct {
 	mode  os.FileMode
 	mtime time.Time
 	raw   string
+	// sizeUnknown is set for a file whose listing gave no size (MLST
+	// facts are optional): Size is 0 then, but the file needn't be empty.
+	sizeUnknown bool
+}
+
+// SizeUnknown reports whether the server gave no size for the file, so
+// that Size's 0 means "not known" rather than "empty". Callers reach it
+// with a type assertion on the os.FileInfo:
+//
+//	if u, ok := info.(interface{ SizeUnknown() bool }); ok && u.SizeUnknown() { … }
+func (f *ftpFile) SizeUnknown() bool {
+	return f.sizeUnknown
 }
 
 func (f *ftpFile) Name() string {
@@ -720,11 +732,12 @@ func parseMLST(entry string, skipSelfParent bool) (os.FileInfo, error) {
 	}
 
 	info := &ftpFile{
-		name:  filepath.Base(name),
-		size:  size,
-		mtime: mtime,
-		raw:   entry,
-		mode:  mode,
+		name:        filepath.Base(name),
+		size:        size,
+		mtime:       mtime,
+		raw:         entry,
+		mode:        mode,
+		sizeUnknown: !mode.IsDir() && facts["size"] == "",
 	}
 
 	return info, nil

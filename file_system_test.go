@@ -193,8 +193,9 @@ func TestParseMLST(t *testing.T) {
 			// endofthelinebbs.com: no size and no time, both optional
 			"Type=file;Perm=r;UNIX.ownername=EOTLBBS; 00index",
 			&ftpFile{
-				name: "00index",
-				mode: os.FileMode(0400),
+				name:        "00index",
+				mode:        os.FileMode(0400),
+				sizeUnknown: true,
 			},
 		},
 		{
