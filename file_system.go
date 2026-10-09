@@ -632,13 +632,14 @@ func parseMLST(entry string, skipSelfParent bool) (os.FileInfo, error) {
 	parseError := ftpError{err: fmt.Errorf(`failed parsing MLST entry: %s`, entry)}
 	incompleteError := ftpError{err: fmt.Errorf(`MLST entry incomplete: %s`, entry)}
 
-	parts := strings.Split(entry, "; ")
-	if len(parts) != 2 {
+	// The facts end at the first "; ": a name may have "; " in it too.
+	factList, name, ok := strings.Cut(entry, "; ")
+	if !ok {
 		return nil, parseError
 	}
 
 	facts := make(map[string]string)
-	for _, factPair := range strings.Split(parts[0], ";") {
+	for _, factPair := range strings.Split(factList, ";") {
 		factParts := strings.SplitN(factPair, "=", 2)
 		if len(factParts) != 2 {
 			return nil, parseError
@@ -695,29 +696,31 @@ func parseMLST(entry string, skipSelfParent bool) (os.FileInfo, error) {
 		err  error
 	)
 
+	// Every fact but the type is optional (RFC 3659, 7.1): a server may
+	// send no size or time (endofthelinebbs.com sends "Type=file;Perm=r;
+	// UNIX.ownername=EOTLBBS; 00index"), and the entry is still an entry,
+	// with its size 0 and its time the zero time.
 	if facts["size"] != "" {
 		size, err = strconv.ParseInt(facts["size"], 10, 64)
 	} else if mode.IsDir() && facts["sizd"] != "" {
 		size, err = strconv.ParseInt(facts["sizd"], 10, 64)
-	} else if facts["type"] == "file" {
-		return nil, incompleteError
 	}
 
 	if err != nil {
 		return nil, parseError
 	}
 
-	if facts["modify"] == "" {
-		return nil, incompleteError
-	}
-
-	mtime, err := time.ParseInLocation(timeFormat, facts["modify"], time.UTC)
-	if err != nil {
-		return nil, incompleteError
+	var mtime time.Time
+	if m := facts["modify"]; m != "" {
+		// the time may have fractions of a second: 20191124122657.123
+		m, _, _ = strings.Cut(m, ".")
+		if mtime, err = time.ParseInLocation(timeFormat, m, time.UTC); err != nil {
+			return nil, parseError
+		}
 	}
 
 	info := &ftpFile{
-		name:  filepath.Base(parts[1]),
+		name:  filepath.Base(name),
 		size:  size,
 		mtime: mtime,
 		raw:   entry,

@@ -189,6 +189,24 @@ func TestParseMLST(t *testing.T) {
 				size:  6,
 			},
 		},
+		{
+			// endofthelinebbs.com: no size and no time, both optional
+			"Type=file;Perm=r;UNIX.ownername=EOTLBBS; 00index",
+			&ftpFile{
+				name: "00index",
+				mode: os.FileMode(0400),
+			},
+		},
+		{
+			// a time with fractions of a second, and "; " in the name
+			"type=file;size=3;modify=20191124122657.123; a; b",
+			&ftpFile{
+				name:  "a; b",
+				mtime: mustParseTime(timeFormat, "20191124122657"),
+				mode:  os.FileMode(0400),
+				size:  3,
+			},
+		},
 	}
 
 	for _, c := range cases {
