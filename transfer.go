@@ -92,6 +92,85 @@ func (c *Client) RetrieveFrom(path string, dest io.Writer, offset int64) error {
 	return nil
 }
 
+// SupportsRestart reports whether the server can start a transfer part way
+// into a file (FEAT lists "REST STREAM"), which RetrieveFrom and
+// RetrieveRange need. A server that can't is not asked to.
+func (c *Client) SupportsRestart() bool { return c.canResume() }
+
+// RetrieveRange copies up to length bytes of file "path", starting at
+// "offset", into "dest", and returns how many it copied. It is for reading a
+// part of a file: the data connection is closed once length bytes have
+// arrived, so a server that has more to send is told to stop (it answers
+// 426) and the rest of the file is not transferred. A range that runs past
+// the end of the file gives the bytes there are, as io.ReaderAt does with
+// io.EOF - here with no error: the caller compares the count with length.
+//
+// Like RetrieveFrom it needs REST STREAM for any offset above zero.
+func (c *Client) RetrieveRange(path string, dest io.Writer, offset, length int64) (int64, error) {
+	if offset < 0 || length < 0 {
+		return 0, ftpError{err: fmt.Errorf("range %d+%d is negative", offset, length)}
+	}
+	if length == 0 {
+		return 0, nil
+	}
+	if offset > 0 && !c.canResume() {
+		return 0, ftpError{err: fmt.Errorf(
+			"cannot start at offset %d: the server does not support REST STREAM", offset)}
+	}
+
+	pconn, err := c.getIdleConn()
+	if err != nil {
+		return 0, err
+	}
+	defer c.returnConn(pconn)
+
+	if err = pconn.setType("I"); err != nil {
+		return 0, err
+	}
+	if offset > 0 {
+		if err := pconn.sendCommandExpected(replyFileActionPending, "REST %d", offset); err != nil {
+			return 0, err
+		}
+	}
+	connGetter, abort, err := pconn.prepareDataConn()
+	if err != nil {
+		return 0, err
+	}
+	defer abort()
+
+	if err = pconn.sendCommandExpected(replyGroupPreliminaryReply, "RETR %s", path); err != nil {
+		return 0, err
+	}
+	dc, err := connGetter()
+	if err != nil {
+		return 0, err
+	}
+	defer dc.Close()
+
+	n, err := io.CopyN(dest, dc, length)
+	if err != nil && err != io.EOF {
+		pconn.broken = true
+		return n, err
+	}
+	// closing the data connection is how the transfer is ended early; the
+	// server's answer is then 426 (aborted) or, if it had finished, 226
+	if cerr := dc.Close(); cerr != nil {
+		pconn.debug("error closing data connection: %s", cerr)
+	}
+	code, msg, rerr := pconn.readResponse()
+	switch {
+	case rerr != nil:
+		// the bytes were read; the control connection is no longer trusted
+		// (readResponse has marked it broken) and is replaced
+		pconn.debug("no answer after the range: %s", rerr)
+	case positiveCompletionReply(code) || code == 426 || code == 450 || code == 451:
+	default:
+		pconn.debug("unexpected response after RETR of a range: %d (%s)", code, msg)
+		return n, ftpError{code: code, msg: msg}
+	}
+	return n, nil
+}
+
 // Store bytes read from "src" into file "path" on the server. If the
 // server supports resuming stream transfers and "src" is an io.Seeker
 // (*os.File is an io.Seeker), Store will continue resuming a failed upload

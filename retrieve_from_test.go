@@ -82,3 +82,47 @@ func TestRetrieveUnchanged(t *testing.T) {
 		c.Close()
 	}
 }
+
+// Retrieving a range: only the bytes asked for, and the connection is fit
+// for the next command afterwards.
+func TestRetrieveRange(t *testing.T) {
+	requireServers(t)
+	const whole = "Lorem ipsum\n"
+	for _, addr := range ftpdAddrs {
+		c, err := DialConfig(goftpConfig, addr)
+		if err != nil {
+			t.Fatalf("%s: %v", addr, err)
+		}
+		if !c.SupportsRestart() {
+			t.Logf("%s: no REST STREAM, skipped", addr)
+			c.Close()
+			continue
+		}
+		for _, tc := range []struct {
+			offset, length int64
+			want           string
+		}{
+			{0, 5, "Lorem"},
+			{6, 5, "ipsum"},
+			{6, 100, "ipsum\n"},
+			{0, 100, whole},
+			{11, 1, "\n"},
+			{3, 0, ""},
+		} {
+			var buf bytes.Buffer
+			n, err := c.RetrieveRange("lorem.txt", &buf, tc.offset, tc.length)
+			if err != nil || buf.String() != tc.want || n != int64(len(tc.want)) {
+				t.Errorf("%s: RetrieveRange(%d, %d) = %q (%d), %v; want %q", addr, tc.offset, tc.length, buf.String(), n, err, tc.want)
+			}
+		}
+		// the same client still works after all those early endings
+		var buf bytes.Buffer
+		if err := c.Retrieve("lorem.txt", &buf); err != nil || buf.String() != whole {
+			t.Errorf("%s: Retrieve after ranges: %q, %v", addr, buf.String(), err)
+		}
+		if _, err := c.RetrieveRange("lorem.txt", &buf, -1, 3); err == nil {
+			t.Errorf("%s: a negative offset was accepted", addr)
+		}
+		c.Close()
+	}
+}

@@ -428,7 +428,21 @@ type ftpFile struct {
 	// sizeUnknown is set for a file whose listing gave no size (MLST
 	// facts are optional): Size is 0 then, but the file needn't be empty.
 	sizeUnknown bool
+	// what a Unix LIST line says besides the above
+	owner, group, linkTarget string
+	fromLIST                 bool
 }
+
+// Owner is the owner column of a Unix LIST line (a name, or a number when the
+// server cannot name it), or "". Reach it with a type assertion on the
+// os.FileInfo, like SizeUnknown.
+func (f *ftpFile) Owner() string { return f.owner }
+
+// Group is the group column of a Unix LIST line, or "" (some servers do not list one).
+func (f *ftpFile) Group() string { return f.group }
+
+// LinkTarget is where a symbolic link of a Unix LIST line points, or "".
+func (f *ftpFile) LinkTarget() string { return f.linkTarget }
 
 // SizeUnknown reports whether the server gave no size for the file, so
 // that Size's 0 means "not known" rather than "empty". Callers reach it
@@ -466,12 +480,77 @@ func (f *ftpFile) Sys() interface{} {
 // How LIST separates a symlink's name from what it points at.
 const symlinkSeparator = " -> "
 
-var lsRegex = regexp.MustCompile(`^\s*(\S)(\S{3})(\S{3})(\S{3})(?:\s+\S+){3}\s+(\d+)\s+(\w+\s+\d+)\s+([\d:]+)\s+(.+)$`)
+// A Unix "ls -l" style line:
+//
+//	drwxr-xr-x   8 goftp    20            272 Jul 28 05:03 git-ignored
+//	-rw-r--r--+  1 u        g              12 2023-01-28 12:34 f
+//
+// The permission string may carry a marker for an ACL or extended
+// attributes (+, @, . or *) after the ninth character; the group column is
+// missing on some servers; the size of a device file is "major, minor"; and the
+// date is "Mon dd hh:mm", "Mon dd yyyy", "dd Mon hh:mm" or ISO ("yyyy-mm-dd
+// hh:mm[:ss[.fff]] [+zzzz]").
+var lsRegex = regexp.MustCompile(`^\s*([-dlbcpsDL?])([-rwxsStT]{3})([-rwxsStT]{3})([-rwxsStT]{3})[+@.*]?` +
+	`\s+(\d+)` + // link count
+	`\s+(\S+)` + // owner
+	`(?:\s+(\S+))??` + // group, which some servers leave out
+	`\s+(\d+(?:,\s*\d+)?)` + // size, or "major, minor"
+	`\s+(\w{3}\s+\d{1,2}\s+(?:\d{1,2}:\d{2}|\d{4})` + // Jan  2 15:04, Jan  2  2006
+	`|\d{1,2}\s+\w{3}\s+(?:\d{1,2}:\d{2}|\d{4})` + // 2 Jan 15:04
+	`|\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:\s+[+-]\d{4})?)` + // 2006-01-02 15:04:05.000 +0000
+	`\s+(.+)$`)
+
+// parseLISTTime reads the date column of a Unix listing.
+func parseLISTTime(s string, loc *time.Location) (time.Time, error) {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) >= 10 && s[4] == '-' { // ISO
+		for _, layout := range []string{"2006-01-02 15:04:05.999999999 -0700", "2006-01-02 15:04:05 -0700", "2006-01-02 15:04 -0700",
+			"2006-01-02 15:04:05.999999999", "2006-01-02 15:04:05", "2006-01-02 15:04"} {
+			if t, err := time.ParseInLocation(layout, s, loc); err == nil {
+				return t, nil
+			}
+		}
+		return time.Time{}, fmt.Errorf("unrecognised date %q", s)
+	}
+	f := strings.Split(s, " ")
+	if len(f) != 3 {
+		return time.Time{}, fmt.Errorf("unrecognised date %q", s)
+	}
+	month, day, last := f[0], f[1], f[2]
+	if _, err := strconv.Atoi(f[0]); err == nil { // "2 Jan 15:04"
+		month, day = f[1], f[0]
+	}
+	if strings.Contains(last, ":") {
+		now := time.Now().In(loc)
+		t, err := time.ParseInLocation("Jan 2 15:04 2006", month+" "+day+" "+last+" "+strconv.Itoa(now.Year()), loc)
+		if err != nil {
+			return time.Time{}, err
+		}
+		// a time without a year is in the past: a month later than this one is last year's
+		if t.After(now.AddDate(0, 0, 1)) {
+			t = t.AddDate(-1, 0, 0)
+		}
+		return t, nil
+	}
+	return time.ParseInLocation("Jan 2 2006", month+" "+day+" "+last, loc)
+}
+
+// unsupportedListing recognises the directory listing formats this parser
+// does not read, so the failure can say which.
+func unsupportedListing(entry string) string {
+	switch {
+	case regexp.MustCompile(`;\d+\s`).MatchString(entry) || strings.Contains(entry, "[") && strings.Contains(entry, "RWED"):
+		return "VMS"
+	case strings.HasPrefix(entry, "+") && strings.Contains(entry, "\t"):
+		return "EPLF"
+	}
+	return ""
+}
 
 // total 404456
 // drwxr-xr-x   8 goftp    20            272 Jul 28 05:03 git-ignored
 func parseLIST(entry string, loc *time.Location, skipSelfParent bool) (os.FileInfo, error) {
-	if strings.HasPrefix(entry, "total ") {
+	if strings.HasPrefix(entry, "total ") || strings.TrimSpace(entry) == "" {
 		return nil, nil
 	}
 
@@ -483,53 +562,75 @@ func parseLIST(entry string, loc *time.Location, skipSelfParent bool) (os.FileIn
 		if info, err := parseDOSLIST(entry, loc); info != nil || err != nil {
 			return info, err
 		}
+		if format := unsupportedListing(entry); format != "" {
+			return nil, ftpError{err: fmt.Errorf(`the server lists directories in the %s format, which is not supported (and it has no MLSD): %s`, format, entry)}
+		}
 		return nil, ftpError{err: fmt.Errorf(`failed parsing LIST entry: %s`, entry)}
 	}
+	// matches: 1 type, 2-4 permissions, 5 links, 6 owner, 7 group, 8 size, 9 date, 10 name
 
-	if skipSelfParent && (matches[8] == "." || matches[8] == "..") {
+	name := matches[10]
+	if skipSelfParent && (name == "." || name == "..") {
 		return nil, nil
 	}
 
 	var mode os.FileMode
 	switch matches[1] {
-	case "d":
+	case "d", "D":
 		mode |= os.ModeDir
-	case "l":
+	case "l", "L":
 		mode |= os.ModeSymlink
+	case "b":
+		mode |= os.ModeDevice
+	case "c":
+		mode |= os.ModeDevice | os.ModeCharDevice
+	case "p":
+		mode |= os.ModeNamedPipe
+	case "s":
+		mode |= os.ModeSocket
 	}
 
 	for i := 0; i < 3; i++ {
-		if matches[i+2][0] == 'r' {
-			mode |= os.FileMode(04 << (3 * uint(2-i)))
+		perm := matches[i+2]
+		shift := uint(3 * (2 - i))
+		if perm[0] == 'r' {
+			mode |= os.FileMode(04 << shift)
 		}
-		if matches[i+2][1] == 'w' {
-			mode |= os.FileMode(02 << (3 * uint(2-i)))
+		if perm[1] == 'w' {
+			mode |= os.FileMode(02 << shift)
 		}
-		if matches[i+2][2] == 'x' || matches[i+2][2] == 's' {
-			mode |= os.FileMode(01 << (3 * uint(2-i)))
-		}
-	}
-
-	size, err := strconv.ParseUint(matches[5], 10, 64)
-	if err != nil {
-		return nil, ftpError{err: fmt.Errorf(`failed parsing LIST entry's size: %s (%s)`, err, entry)}
-	}
-
-	var mtime time.Time
-	if strings.Contains(matches[7], ":") {
-		mtime, err = time.ParseInLocation("Jan _2 15:04", matches[6]+" "+matches[7], loc)
-		if err == nil {
-			now := time.Now()
-			year := now.Year()
-			if mtime.Month() > now.Month() {
-				year--
+		switch perm[2] {
+		case 'x':
+			mode |= os.FileMode(01 << shift)
+		case 's', 'S':
+			if perm[2] == 's' {
+				mode |= os.FileMode(01 << shift)
 			}
-			mtime, err = time.ParseInLocation("Jan _2 15:04 2006", matches[6]+" "+matches[7]+" "+strconv.Itoa(year), loc)
+			if i == 0 {
+				mode |= os.ModeSetuid
+			} else if i == 1 {
+				mode |= os.ModeSetgid
+			}
+		case 't', 'T':
+			if perm[2] == 't' {
+				mode |= os.FileMode(01 << shift)
+			}
+			if i == 2 {
+				mode |= os.ModeSticky
+			}
 		}
-	} else {
-		mtime, err = time.ParseInLocation("Jan _2 2006", matches[6]+" "+matches[7], loc)
 	}
 
+	var size uint64
+	if sizeField := matches[8]; !strings.Contains(sizeField, ",") { // a device has no size
+		var err error
+		size, err = strconv.ParseUint(sizeField, 10, 64)
+		if err != nil {
+			return nil, ftpError{err: fmt.Errorf(`failed parsing LIST entry's size: %s (%s)`, err, entry)}
+		}
+	}
+
+	mtime, err := parseLISTTime(matches[9], loc)
 	if err != nil {
 		return nil, ftpError{err: fmt.Errorf(`failed parsing LIST entry's mtime: %s (%s)`, err, entry)}
 	}
@@ -548,19 +649,27 @@ func parseLIST(entry string, loc *time.Location, skipSelfParent bool) (os.FileIn
 	// contain " -> ", which makes this ambiguous — but the ambiguity is
 	// in LIST's own output, which renders both cases identically, so no
 	// reader can do better.
-	name := matches[8]
+	target := ""
 	if mode&os.ModeSymlink != 0 {
 		if i := strings.Index(name, symlinkSeparator); i >= 0 {
+			target = strings.TrimSpace(name[i+len(symlinkSeparator):])
 			name = name[:i]
 		}
 	}
 
+	// a listing with two columns where others have three names the owner only
+	owner, group := matches[6], matches[7]
+
 	info := &ftpFile{
-		name:  filepath.Base(name),
-		mode:  mode,
-		mtime: mtime,
-		raw:   entry,
-		size:  int64(size),
+		name:       filepath.Base(name),
+		mode:       mode,
+		mtime:      mtime,
+		raw:        entry,
+		size:       int64(size),
+		owner:      owner,
+		group:      group,
+		linkTarget: target,
+		fromLIST:   true,
 	}
 
 	return info, nil
