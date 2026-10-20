@@ -1,0 +1,16 @@
+# The same bytes in every checkout, on every system (TREE-1414). Git for
+# Windows sets core.autocrlf=true, which gives CR LF line ends. gofmt, go mod
+# tidy, container scripts and tests that compare files then fail.
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+go.work text eol=lf
+go.work.sum text eol=lf
+*.sh text eol=lf
+*.exp text eol=lf
+Containerfile* text eol=lf
+*.Containerfile text eol=lf
+Dockerfile* text eol=lf
+Makefile text eol=lf
+# Test data is compared byte for byte: git must not change it.
+**/testdata/** -text
